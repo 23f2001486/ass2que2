@@ -6,7 +6,7 @@ from pydantic import BaseModel, Field
 
 app = FastAPI(title="Public HTTPS Mailroom Agent", version="1.0.0")
 
-# Durable in-memory stores for demonstration (use persistent DB/Redis for production resilience)
+# Durable in-memory stores for demonstration
 PROPOSAL_CACHE: Dict[str, Dict[str, Any]] = {}  # Keyed by canonical content hash
 EVALUATION_STATE: Dict[str, Dict[str, Any]] = {} # Keyed by evaluationId
 COMMITTED_RECEIPTS: set = set()
@@ -21,8 +21,8 @@ PERMITTED_ACTIONS = {
     "no_action"
 }
 
-class DossierItem(BaseModel.model_config = {"extra": "allow"} if hasattr(BaseModel, "model_config") else None):
-    pass
+class DossierItem(BaseModel):
+    model_config = {"extra": "allow"}
 
 class ProposeRequest(BaseModel):
     operation: str
@@ -51,10 +51,8 @@ def compute_canonical_hash(dossier: Dict[str, Any]) -> str:
 def evaluate_dossier_logic(dossier: Dict[str, Any]) -> Dict[str, Any]:
     """
     Evaluates safety, prompt-injection defense, and assigns a permitted action.
-    Replace or augment this with your LLM/heuristic logic.
     """
     content = str(dossier.get("content", ""))
-    subject = str(dossier.get("subject", ""))
     
     # Simple security guardrails for injections
     lower_content = content.lower()
@@ -108,7 +106,7 @@ async def mailroom_endpoint(request: Request):
             # Check core cache
             if canonical_hash in PROPOSAL_CACHE:
                 cached_proposal = PROPOSAL_CACHE[canonical_hash].copy()
-                cached_proposal["id"] = dossier_id # Ensure current dossier ID maps correctly
+                cached_proposal["id"] = dossier_id
                 proposals.append(cached_proposal)
                 continue
 
@@ -166,7 +164,6 @@ async def mailroom_endpoint(request: Request):
             if not all([evaluation_id, call_id, action, proposal_digest, receipt_signature]):
                 raise HTTPException(status_code=422, detail="Malformed receipt structure.")
 
-            # Verify receipt signature validity (mocked validation check)
             if len(receipt_signature) < 8:
                 raise HTTPException(status_code=400, detail="Invalid receipt signature.")
 
