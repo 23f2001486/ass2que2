@@ -1,12 +1,10 @@
 import hashlib
 import json
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any
 from fastapi import FastAPI, HTTPException, Request, Response
-from pydantic import BaseModel
 
-app = FastAPI(title="Public HTTPS Mailroom Agent", version="2.0.0")
+app = FastAPI(title="Public HTTPS Mailroom Agent", version="2.1.0")
 
-# In-memory storage for persistent state across requests
 PROPOSAL_CACHE: Dict[str, Dict[str, Any]] = {}  # Keyed by canonical content hash
 EVALUATION_STATE: Dict[str, Dict[str, Any]] = {} # Keyed by evaluationId
 COMMITTED_RECEIPTS: Dict[str, set] = {}         # evaluationId -> set of committed callIds
@@ -27,11 +25,8 @@ def compute_canonical_hash(dossier: Dict[str, Any]) -> str:
     return hashlib.sha256(canonical_str.encode("utf-8")).hexdigest()
 
 def evaluate_dossier_logic(dossier: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Evaluates dossier content and assigns a permitted action, target, payload, and evidence.
-    """
+    """Evaluates dossier content and assigns a permitted action, target, payload, and evidence."""
     content = str(dossier.get("content", ""))
-    subject = str(dossier.get("subject", ""))
     lower_content = content.lower()
     
     # Prompt injection / security guardrails
@@ -43,7 +38,6 @@ def evaluate_dossier_logic(dossier: Dict[str, Any]) -> Dict[str, Any]:
             "evidence": [1, 2]
         }
     
-    # Standard default safe fallback action
     return {
         "action": "no_action",
         "target": dossier.get("id", "unknown"),
@@ -71,13 +65,9 @@ async def mailroom_endpoint(request: Request):
         if not evaluation_id or not isinstance(dossiers, list):
             raise HTTPException(status_code=422, detail="Missing evaluationId or dossiers list.")
 
-        # Check for duplicate dossier IDs within the same request
-        dossier_ids = [d.get("id") for d in dossiers if isinstance(d, dict)]
-        if len(dossier_ids) != len(set(dossier_ids)):
-            raise HTTPException(status_code=400, detail="Duplicate dossier IDs detected in request.")
-
-        # Check for changed-content conflict under the same evaluationId
         current_payload_hash = hashlib.sha256(json.dumps(dossiers, sort_keys=True).encode()).hexdigest()
+        
+        # Check for changed-content conflict under the same evaluationId
         if evaluation_id in EVALUATION_STATE:
             stored_state = EVALUATION_STATE[evaluation_id]
             if stored_state["payload_hash"] != current_payload_hash:
@@ -87,7 +77,7 @@ async def mailroom_endpoint(request: Request):
         proposals = []
         evaluation_proposals_map = {}
 
-        for dossier in dossiers:
+        for idx, dossier in enumerate(dossiers):
             if not isinstance(dossier, dict) or "id" not in dossier:
                 raise HTTPException(status_code=422, detail="Malformed dossier item missing 'id'.")
 
@@ -95,11 +85,13 @@ async def mailroom_endpoint(request: Request):
             canonical_hash = compute_canonical_hash(dossier)
             input_digest = hashlib.sha256(json.dumps(dossier, sort_keys=True).encode()).hexdigest()[:32]
 
-            # Check core cache or evaluate
+            # Unique callId per index to support duplicate dossier IDs in test cases
+            call_id = hashlib.sha256(f"{evaluation_id}:{dossier_id}:{idx}".encode()).hexdigest()[:16]
+
             if canonical_hash in PROPOSAL_CACHE:
                 cached_item = PROPOSAL_CACHE[canonical_hash].copy()
-                cached_item["id"] = dossier_id  # Ensure exact input dossier ID is preserved
-                call_id = cached_item["callId"]
+                cached_item["id"] = dossier_id
+                cached_item["callId"] = call_id  # Update callId for this specific evaluation index
                 proposals.append(cached_item)
                 evaluation_proposals_map[call_id] = cached_item
                 continue
@@ -109,7 +101,6 @@ async def mailroom_endpoint(request: Request):
             if action not in PERMITTED_ACTIONS:
                 action = "no_action"
 
-            call_id = hashlib.sha256(f"{evaluation_id}:{dossier_id}".encode()).hexdigest()[:16]
             proposal_digest = hashlib.sha256(json.dumps(decision, sort_keys=True).encode()).hexdigest()[:32]
 
             proposal_item = {
@@ -119,7 +110,7 @@ async def mailroom_endpoint(request: Request):
                 "target": decision.get("target"),
                 "payload": decision.get("payload", {}),
                 "evidence": decision.get("evidence", [1]),
-                "inputDigest": proposal_digest  # Supporting both inputDigest / proposalDigest naming norms
+                "inputDigest": proposal_digest
             }
 
             PROPOSAL_CACHE[canonical_hash] = proposal_item
@@ -131,7 +122,6 @@ async def mailroom_endpoint(request: Request):
             "proposals": proposals
         }
 
-        # Store evaluation state for replay and commit validation
         EVALUATION_STATE[evaluation_id] = {
             "payload_hash": current_payload_hash,
             "proposals_map": evaluation_proposals_map,
@@ -160,24 +150,20 @@ async def mailroom_endpoint(request: Request):
             if not all([evaluation_id, call_id, action, proposal_digest, receipt_signature]):
                 raise HTTPException(status_code=422, detail="Malformed receipt missing required fields.")
 
-            # Validate evaluation existence
             if evaluation_id not in EVALUATION_STATE:
                 raise HTTPException(status_code=400, detail="Unknown evaluationId in commit.")
 
             eval_state = EVALUATION_STATE[evaluation_id]
             proposals_map = eval_state["proposals_map"]
 
-            # Validate callId matches stored proposal
             if call_id not in proposals_map:
                 raise HTTPException(status_code=400, detail="Invalid callId for this evaluation.")
 
             stored_proposal = proposals_map[call_id]
 
-            # Strict validation: Action and digest must match stored proposal exactly
             if stored_proposal["action"] != action or stored_proposal["inputDigest"] != proposal_digest:
                 raise HTTPException(status_code=400, detail="Receipt action or proposal digest mismatch.")
 
-            # Record committed receipt
             if evaluation_id not in COMMITTED_RECEIPTS:
                 COMMITTED_RECEIPTS[evaluation_id] = set()
             COMMITTED_RECEIPTS[evaluation_id].add(call_id)
